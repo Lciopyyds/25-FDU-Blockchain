@@ -1,0 +1,21 @@
+# Go build files
+bin/
+*.exe
+
+# Blockchain data files
+chain_*.json
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.cache
+
+# IDE
+.vscode/
+.idea/
+
+# OS garbage
+.DS_Store
+Thumbs.db

@@ -1,0 +1,36 @@
+### ping 8001 看看在不在
+GET http://localhost:8001/
+Accept: text/plain
+
+
+### 交易 1：Alice -> Bob 12
+POST http://localhost:8001/newtx
+Content-Type: application/json
+
+{
+    "From": "Alice",
+    "To": "Bob",
+    "Value": 12
+}
+
+
+### 交易 2：Bob -> Carol 5
+POST http://localhost:8001/newtx
+Content-Type: application/json
+
+{
+    "From": "Bob",
+    "To": "Carol",
+    "Value": 5
+}
+
+
+### 交易 3：Carol -> Dave 3
+POST http://localhost:8001/newtx
+Content-Type: application/json
+
+{
+    "From": "Carol",
+    "To": "Dave",
+    "Value": 3
+}
