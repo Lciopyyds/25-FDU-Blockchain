@@ -236,14 +236,23 @@ func (s *P2PServer) BroadcastBlock(block *core.Block) {
 func (s *P2PServer) handleMine(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("收到挖矿请求，开始挖矿...")
 
-	// 1. 没有交易就没必要挖矿
-	if len(s.Mempool) == 0 {
-		fmt.Println("当前交易池为空，暂不挖矿")
-		fmt.Fprintln(w, "交易池为空，无法挖矿")
+	// 0. 从 URL 上拿矿工地址：/mine?addr=<钱包Address>
+	minerAddr := r.URL.Query().Get("addr")
+	if minerAddr == "" {
+		// 没给地址就直接报错，避免奖励打到奇怪的字符串上
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, "缺少矿工地址，请使用 /mine?addr=<你的钱包Address>")
 		return
 	}
 
-	// 2. 计算本次最多打包多少笔交易
+	// 1. 现在「交易池为空」不再阻止挖矿，而是只打 coinbase
+	if len(s.Mempool) == 0 {
+		fmt.Println("当前交易池为空，本次只打包 coinbase 挖矿奖励交易")
+	} else {
+		fmt.Println("当前交易池大小：", len(s.Mempool))
+	}
+
+	// 2. 计算本次最多打包多少笔「普通交易」
 	txCount := len(s.Mempool)
 	if txCount > MaxTxPerBlock {
 		txCount = MaxTxPerBlock
@@ -251,27 +260,34 @@ func (s *P2PServer) handleMine(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("本次将从交易池中打包", txCount, "笔交易进行挖矿")
 
 	// 3. 构造 coinbase 奖励交易（放在第一笔）
+	//    ✅ 奖励直接打给 minerAddr（钱包 Address），而不是 "miner-端口"
 	reward := core.Transaction{
 		From:  "COINBASE",
-		To:    "miner-" + s.Port, // 简单约定：矿工地址 = miner-端口
+		To:    minerAddr,
 		Value: BlockReward,
 	}
 	reward.CalculateHash()
 
 	// 4. 组装本次要打包进区块的交易列表：
-	//    [coinbase] + [前 txCount 笔普通交易]
+	//    [coinbase] + [前 txCount 笔普通交易]（txCount 可能为 0）
 	txs := make([]core.Transaction, 0, txCount+1)
 	txs = append(txs, reward)
-	txs = append(txs, s.Mempool[:txCount]...)
 
-	// 5. 将已打包的交易从 mempool 中移除，保留未打包部分
-	if txCount == len(s.Mempool) {
-		// 全部打完，清空交易池
-		s.Mempool = []core.Transaction{}
+	if txCount > 0 {
+		txs = append(txs, s.Mempool[:txCount]...)
+		// 5. 将已打包的普通交易从 mempool 中移除，保留未打包部分
+		if txCount == len(s.Mempool) {
+			// 全部打完，清空交易池
+			s.Mempool = []core.Transaction{}
+		} else {
+			// 只打包了前 txCount 笔，后面的留在池子里
+			s.Mempool = s.Mempool[txCount:]
+		}
 	} else {
-		// 只打包了前 txCount 笔，后面的留在池子里
-		s.Mempool = s.Mempool[txCount:]
+		// 完全空池：只有 coinbase，此时直接把 mempool 清空即可（本来也为空）
+		s.Mempool = []core.Transaction{}
 	}
+
 	fmt.Println("挖矿后交易池剩余：", len(s.Mempool))
 
 	// 6. 使用 AddBlock 挖矿并加入链
@@ -297,7 +313,7 @@ func (s *P2PServer) handleMine(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Fprintf(w, "挖矿完成，高度=%d，Hash=%s，本次打包交易数=%d，剩余交易池=%d\n",
+	fmt.Fprintf(w, "挖矿完成，高度=%d，Hash=%s，本次打包交易数=%d（含1笔coinbase），剩余交易池=%d\n",
 		len(s.BC.Blocks)-1, utils.ToHex(newBlock.Header.Hash),
 		len(txs), len(s.Mempool))
 }
@@ -421,22 +437,31 @@ func (s *P2PServer) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *P2PServer) handleBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	addr := r.URL.Query().Get("addr")
-	if addr == "" {
+	raw := r.URL.Query().Get("addr")
+	if raw == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error": "missing addr parameter"}`))
 		return
 	}
 
+	addr := ResolveAddress(raw) // ✅ 支持传昵称或地址
+
 	// 调用 core 层的 GetBalance
 	balance := s.BC.GetBalance(addr)
 
+	// 找展示名
+	display := DisplayName(addr)
+
 	// 返回 JSON
 	resp := struct {
-		Address string `json:"address"`
+		Input   string `json:"input"`   // 用户传进来的原始字符串
+		Address string `json:"address"` // 实际地址
+		Name    string `json:"name"`    // 昵称+缩写
 		Balance int64  `json:"balance"`
 	}{
+		Input:   raw,
 		Address: addr,
+		Name:    display,
 		Balance: balance,
 	}
 
@@ -449,7 +474,6 @@ func (s *P2PServer) topBalances(n int) []struct {
 	Addr    string
 	Balance int64
 } {
-	// 确保余额表是最新的
 	s.BC.RebuildBalances()
 
 	type item struct {
@@ -458,14 +482,12 @@ func (s *P2PServer) topBalances(n int) []struct {
 	}
 	var items []item
 	for addr, bal := range s.BC.Balances {
-		// 可以选择性地过滤掉系统地址，例如 COINBASE、miner-xxx
 		if addr == "COINBASE" {
 			continue
 		}
 		items = append(items, item{addr: addr, bal: bal})
 	}
 
-	// 按余额从高到低排序
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].bal > items[j].bal
 	})
@@ -484,7 +506,7 @@ func (s *P2PServer) topBalances(n int) []struct {
 			Addr    string
 			Balance int64
 		}{
-			Addr:    items[i].addr,
+			Addr:    DisplayName(items[i].addr), // ✅ 这里用昵称+缩写
 			Balance: items[i].bal,
 		}
 	}
